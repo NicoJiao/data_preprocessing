@@ -1,6 +1,7 @@
-# data_preprocessing
 import os
+import dask.dataframe as dd
 import pandas as pd
+from dask.distributed import Client
 from datetime import datetime, timedelta
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,7 +12,7 @@ logging.basicConfig(filename='processing_log.txt', level=logging.INFO,
 
 def process_csv_files(start_date, end_date, users=None, base_folder='.'):
     """
-    Process CSV files for specified users (or all users) within a given date range.
+    Process CSV.GZ files for specified users (or all users) within a given date range using Dask.
 
     :param start_date: Start date in 'YYYYMMDD' format
     :param end_date: End date in 'YYYYMMDD' format
@@ -21,12 +22,17 @@ def process_csv_files(start_date, end_date, users=None, base_folder='.'):
     execution_start_time = datetime.now()
     logging.info(f"Execution started - Date range: {start_date} to {end_date}, Users: {'All users' if users is None else users}")
 
+    # Start Dask client
+    client = Client()
+    logging.info(f"Dask client started with {client.ncores} cores")
+
     start = datetime.strptime(start_date, '%Y%m%d')
     end = datetime.strptime(end_date, '%Y%m%d')
     date_range = [start + timedelta(days=x) for x in range((end-start).days + 1)]
 
     all_data = {}
     missing_files = []
+    missing_folders = []
     discontinuities = []
 
     with ThreadPoolExecutor() as executor:
@@ -35,8 +41,11 @@ def process_csv_files(start_date, end_date, users=None, base_folder='.'):
             date = future_to_date[future]
             try:
                 result = future.result()
-                update_all_data(all_data, result['data'])
+                if result['data']:
+                    update_all_data(all_data, result['data'])
                 missing_files.extend(result['missing'])
+                if not result['data'] and not result['missing']:
+                    missing_folders.append(date.strftime('%Y%m%d'))
             except Exception as exc:
                 logging.error(f'Error processing folder {date.strftime("%Y%m%d")}: {exc}')
 
@@ -45,35 +54,36 @@ def process_csv_files(start_date, end_date, users=None, base_folder='.'):
 
     # Output results
     output_results(all_data, start_date, end_date)
-    log_processing_summary(missing_files, discontinuities)
+    log_processing_summary(missing_files, missing_folders, discontinuities)
 
+    client.close()
     execution_end_time = datetime.now()
     execution_duration = execution_end_time - execution_start_time
     logging.info(f"Execution completed - Total duration: {execution_duration}")
     logging.info("-" * 50)  # Add a separator line to indicate the end of this execution
 
 def process_date_folder(date, users, base_folder):
-    """Process CSV files in a single date folder"""
+    """Process CSV.GZ files in a single date folder using Dask"""
     folder_name = date.strftime('%Y%m%d')
     folder_path = os.path.join(base_folder, folder_name)
     result = {'data': {}, 'missing': []}
 
     if not os.path.exists(folder_path):
         logging.warning(f"Folder does not exist: {folder_path}")
-        return result
+        return result  # Return empty result, but continue execution
 
     for file in os.listdir(folder_path):
-        if file.endswith('.csv'):
-            user = file[:-4]  # Assuming file name format is "32-bit UID.csv"
+        if file.endswith('.csv.gz'):
+            user = file[:-7]  # Remove '.csv.gz' to get the user ID
             if users is None or user in users:
                 file_path = os.path.join(folder_path, file)
                 try:
-                    df = pd.read_csv(file_path, parse_dates=['timestamp'])
-                    if not df.empty:
+                    df = dd.read_csv(file_path, compression='gzip', parse_dates=['timestamp'])
+                    if not df.empty.compute():
                         result['data'][user] = {
                             'folder': folder_name,
-                            'start_time': df['timestamp'].min(),
-                            'end_time': df['timestamp'].max(),
+                            'start_time': df['timestamp'].min().compute(),
+                            'end_time': df['timestamp'].max().compute(),
                             'data': df
                         }
                     else:
@@ -113,19 +123,25 @@ def update_all_data(all_data, new_data):
         all_data[user][data['folder']] = data
 
 def output_results(all_data, start_date, end_date):
-    """Output processed data"""
+    """Output processed data using Dask"""
     output_folder = 'processed_data'
     os.makedirs(output_folder, exist_ok=True)
     
     for user, folders_data in all_data.items():
-        output_file = os.path.join(output_folder, f'{user}_{start_date}_{end_date}.csv')
-        combined_df = pd.concat([folder_data['data'] for folder_data in folders_data.values()])
-        combined_df.sort_values('timestamp').to_csv(output_file, index=False)
+        output_file = os.path.join(output_folder, f'{user}_{start_date}_{end_date}.csv.gz')
+        combined_df = dd.concat([folder_data['data'] for folder_data in folders_data.values()])
+        combined_df = combined_df.sort_values('timestamp')
+        combined_df.to_csv(output_file, index=False, compression='gzip', single_file=True)
         logging.info(f"Data for user {user} has been output to {output_file}")
 
-def log_processing_summary(missing_files, discontinuities):
+def log_processing_summary(missing_files, missing_folders, discontinuities):
     """Log processing summary"""
     logging.info("Processing Summary:")
+    if missing_folders:
+        logging.info("Missing folders:")
+        for folder in missing_folders:
+            logging.info(f"  Folder {folder} does not exist")
+    
     if missing_files:
         logging.info("Missing files:")
         for folder, user in missing_files:
